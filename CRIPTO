@@ -1,0 +1,1602 @@
+######## TFM #############################################
+
+
+#librerias y demas
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
+from scipy.stats import skew, kurtosis, t as student_t, kstest, norm
+from scipy.special import gammaln
+
+import statsmodels.api as sm
+from statsmodels.tsa.stattools import adfuller, acf, pacf
+from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
+from statsmodels.stats.stattools import jarque_bera
+from statsmodels.graphics.tsaplots import plot_acf
+from statsmodels.graphics.gofplots import qqplot
+
+from arch import arch_model
+from matplotlib.gridspec import GridSpec
+
+# ============================================================
+# 1) CARGA Y LIMPIEZA
+# ============================================================
+
+# Cargar CSV (formato es-ES: miles con '.' y decimales con ',')
+df_btc = pd.read_csv("bitcoin.csv", sep=";")
+df_eth = pd.read_csv("ethereum.csv", sep=";")
+
+# Normalizar nombres
+df_btc.columns = df_btc.columns.str.strip().str.lower()
+df_eth.columns = df_eth.columns.str.strip().str.lower()
+
+# Limpiar y parsear
+def _parse_df(df):
+    df = df.copy()
+    # limpiar precio con $, puntos de miles y comas decimales
+    df["close"] = df["close"].astype(str).str.replace("$", "", regex=False)
+    df["close"] = df["close"].str.replace(".", "", regex=False)   # remueve miles
+    df["close"] = df["close"].str.replace(",", ".", regex=False)  # decimales
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors="coerce")
+    df = df.dropna(subset=["date", "close"]).set_index("date").sort_index()
+    return df
+
+df_btc = _parse_df(df_btc)
+df_eth = _parse_df(df_eth)
+
+
+# ) GRÁFICO PRECIO + ESTADÍSTICAS
+
+
+def resumen_estadistico(serie):
+    s = pd.Series(serie).astype(float).dropna()
+    return {
+        "Media":     round(s.mean(), 2),
+        "Mediana":   round(s.median(), 2),
+        "Máx":       round(s.max(), 2),
+        "Mín":       round(s.min(), 2),
+        "Desv. Est": round(s.std(ddof=1), 2),
+        "Asimetría": round(skew(s, bias=False, nan_policy="omit"), 2),
+        "Curtosis":  round(kurtosis(s, fisher=False, bias=False, nan_policy="omit"), 2),
+    }
+
+def graficar_precio_con_stats(df, columna="close", titulo="Activo"):
+    colmap = {c.lower(): c for c in df.columns}
+    col = colmap.get(columna.lower(), None)
+    if col is None:
+        num_cols = df.select_dtypes(include="number").columns
+        if len(num_cols) == 0:
+            raise ValueError("El DataFrame no tiene columnas numéricas.")
+        col = num_cols[0]
+
+    s = pd.Series(df[col]).astype(float).dropna()
+    stats_dict = resumen_estadistico(s)
+
+    fig = plt.figure(figsize=(12, 4))
+    gs  = GridSpec(1, 2, width_ratios=[3, 2], figure=fig)
+
+    # (a) Precio
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax1.plot(s.index, s.values, linewidth=1.4)
+    ax1.set_title(f"{titulo} — {col}")
+    ax1.set_ylabel("Precio")
+    ax1.grid(True, linestyle=":", alpha=0.6)
+
+    # (b) Panel de estadísticas
+    ax2 = fig.add_subplot(gs[0, 1]); ax2.axis("off")
+    lines = [f"{k}: {v}" for k, v in stats_dict.items()]
+    ax2.text(0.02, 0.98, "\n".join(lines), va="top", ha="left", fontsize=10)
+
+    plt.tight_layout()
+    plt.show()
+    return stats_dict
+
+_ = graficar_precio_con_stats(df_btc, "close", "Bitcoin")
+_ = graficar_precio_con_stats(df_eth, "close", "Ethereum")
+
+# 
+# RETORNOS, HISTOGRAMAS, ADF, ACF/PACF, ARCH-LM
+# 
+
+# Retornos logarítmicos
+df_btc["retorno_log"] = np.log(df_btc["close"] / df_btc["close"].shift(1))
+df_eth["retorno_log"] = np.log(df_eth["close"] / df_eth["close"].shift(1))
+btc_log_returns = df_btc["retorno_log"].dropna()
+eth_log_returns = df_eth["retorno_log"].dropna()
+
+# Resumen retornos + gráfico
+def resumen_retornos(serie):
+    s = pd.Series(serie).dropna()
+    return {
+        "Media":     round(s.mean(), 4),
+        "Mediana":   round(s.median(), 4),
+        "Desv. Est": round(s.std(ddof=1), 4),
+        "Asimetría": round(skew(s, bias=False, nan_policy="omit"), 4),
+        "Curtosis":  round(kurtosis(s, fisher=False, bias=False, nan_policy="omit"), 4),
+        "Mín":       round(s.min(), 4),
+        "Máx":       round(s.max(), 4),
+    }
+
+fig, axes = plt.subplots(2, 1, figsize=(12,7), sharex=True)
+stats_btc = resumen_retornos(btc_log_returns)
+axes[0].plot(btc_log_returns.index, btc_log_returns, color="black")
+axes[0].axhline(0, color="red", linewidth=1, linestyle="--")
+axes[0].set_title("Retornos logarítmicos — Bitcoin")
+axes[0].text(1.01, 0.5, "\n".join([f"{k}: {v}" for k,v in stats_btc.items()]),
+             transform=axes[0].transAxes, fontsize=9, va="center",
+             bbox=dict(boxstyle="round", facecolor="white", alpha=0.7))
+
+stats_eth = resumen_retornos(eth_log_returns)
+axes[1].plot(eth_log_returns.index, eth_log_returns, color="black")
+axes[1].axhline(0, color="red", linewidth=1, linestyle="--")
+axes[1].set_title("Retornos logarítmicos — Ethereum")
+axes[1].text(1.01, 0.5, "\n".join([f"{k}: {v}" for k,v in stats_eth.items()]),
+             transform=axes[1].transAxes, fontsize=9, va="center",
+             bbox=dict(boxstyle="round", facecolor="white", alpha=0.7))
+plt.tight_layout(); plt.show()
+
+# Histogramas
+fig, axes = plt.subplots(1, 2, figsize=(14,5), sharey=True)
+axes[0].hist(btc_log_returns, bins=100, alpha=0.7, color="black")
+axes[0].set_title("BTC — Retornos logarítmicos"); axes[0].grid(True)
+axes[1].hist(eth_log_returns, bins=100, alpha=0.7, color="black")
+axes[1].set_title("ETH — Retornos logarítmicos"); axes[1].grid(True)
+plt.tight_layout(); plt.show()
+
+# ADF (estacionariedad)
+def adf_test(series, nombre="ADF Test"):
+    stat, pval, lags, nobs, crit, icbest = adfuller(series.dropna(), autolag="AIC")
+    print(f"\n=== {nombre} ===")
+    print(f"Estadístico ADF: {stat:.4f}")
+    print(f"p-valor: {pval:.6f}")
+    print(f"Lags usados: {lags}")
+    print(f"Observaciones: {nobs}")
+    print("Valores críticos:", {k: round(v,4) for k,v in crit.items()})
+
+adf_test(btc_log_returns, "ADF Test Bitcoin")
+adf_test(eth_log_returns, "ADF Test Ethereum")
+
+# ACF/PACF (barras)
+def acf_pacf_barras(series, lags=40, titulo="Serie"):
+    acf_vals = acf(series.dropna(), nlags=lags, fft=True)
+    pacf_vals = pacf(series.dropna(), nlags=lags, method="ywm")
+    conf = 1.96/np.sqrt(len(series.dropna()))
+    fig, axes = plt.subplots(1, 2, figsize=(14,4))
+    axes[0].bar(range(len(acf_vals)), acf_vals, color="black")
+    axes[0].axhline(0, color="black", linewidth=1)
+    axes[0].axhline(conf, color="red", linestyle="--")
+    axes[0].axhline(-conf, color="red", linestyle="--")
+    axes[0].set_title(f"{titulo} - ACF")
+    axes[1].bar(range(len(pacf_vals)), pacf_vals, color="gray")
+    axes[1].axhline(0, color="black", linewidth=1)
+    axes[1].axhline(conf, color="red", linestyle="--")
+    axes[1].axhline(-conf, color="red", linestyle="--")
+    axes[1].set_title(f"{titulo} - PACF")
+    plt.tight_layout(); plt.show()
+
+acf_pacf_barras(btc_log_returns, lags=40, titulo="BTC Retornos log")
+acf_pacf_barras(eth_log_returns, lags=40, titulo="ETH Retornos log")
+
+# ARCH-LM
+arch_test_btc = het_arch(btc_log_returns.dropna(), nlags=12)
+arch_test_eth = het_arch(eth_log_returns.dropna(), nlags=12)
+res_arch_lm = pd.DataFrame({
+    "Estadístico LM": [arch_test_btc[0], arch_test_eth[0]],
+    "p-valor LM":     [arch_test_btc[1], arch_test_eth[1]],
+    "Estadístico F":  [arch_test_btc[2], arch_test_eth[2]],
+    "p-valor F":      [arch_test_btc[3], arch_test_eth[3]],
+}, index=["BTC", "ETH"])
+print("\n=== ARCH-LM Test Resultados ===")
+print(res_arch_lm.round(4))
+
+# ACF de retornos^2 y QQ normal
+fig, axes = plt.subplots(2, 2, figsize=(12,8))
+sm.graphics.tsa.plot_acf((btc_log_returns.dropna()**2), lags=30, ax=axes[0,0]); axes[0,0].set_title("BTC — ACF retornos²")
+sm.graphics.tsa.plot_acf((eth_log_returns.dropna()**2), lags=30, ax=axes[1,0]); axes[1,0].set_title("ETH — ACF retornos²")
+sm.ProbPlot(btc_log_returns.dropna(), dist=norm).qqplot(line="s", ax=axes[0,1]); axes[0,1].set_title("BTC — QQ-Plot normal")
+sm.ProbPlot(eth_log_returns.dropna(), dist=norm).qqplot(line="s", ax=axes[1,1]); axes[1,1].set_title("ETH — QQ-Plot normal")
+plt.tight_layout(); plt.show()
+
+# 
+# 4) MODELADO ARCH/GARCH VARIOS (BTC y ETH)
+# 
+
+# Escalar a % (arch recomienda retornos ~O(1))
+r_btc = (btc_log_returns.dropna() * 100)
+r_eth = (eth_log_returns.dropna() * 100)
+
+model_specs = [
+    ("ARCH(1)",        {"vol":"ARCH",  "p":1, "q":0, "o":0, "dist":"normal"}),
+    ("ARCH(2)",        {"vol":"ARCH",  "p":2, "q":0, "o":0, "dist":"normal"}),
+    ("GARCH(1,1)",     {"vol":"GARCH", "p":1, "q":1, "o":0, "dist":"normal"}),
+    ("GARCH(2,1)",     {"vol":"GARCH", "p":2, "q":1, "o":0, "dist":"normal"}),
+    ("GARCH(1,2)",     {"vol":"GARCH", "p":1, "q":2, "o":0, "dist":"normal"}),
+    ("EGARCH(2,1)-t",  {"vol":"EGARCH","p":2, "q":1, "o":0, "dist":"t"}),
+    ("EGARCH(1,1)-t",  {"vol":"EGARCH","p":1, "q":1, "o":0, "dist":"t"}),
+    ("GJR–GARCH(1,1)-t",{"vol":"GARCH","p":1, "q":1, "o":1, "dist":"t"}),
+]
+
+def fit_models(r, specs):
+    modelos = {}
+    for name, s in specs:
+        am = arch_model(r, mean="constant", vol=s["vol"], p=s["p"], q=s["q"], o=s["o"], dist=s["dist"])
+        try:
+            modelos[name] = am.fit(disp="off")
+        except Exception as e:
+            print(f"[WARN] {name} no convergió: {e}")
+    return modelos
+
+modelos_btc = fit_models(r_btc, model_specs)
+modelos_eth = fit_models(r_eth, model_specs)
+
+def tabla_modelos(modelos_dict):
+    filas = []
+    for name, res in modelos_dict.items():
+        filas.append({
+            "Modelo": name,
+            "AIC": res.aic,
+            "BIC": res.bic,
+            "LogLik": res.loglikelihood,
+            "Todos signif.": "Sí" if (res.pvalues < 0.05).all() else "No"
+        })
+    df = (pd.DataFrame(filas)
+            .set_index("Modelo")
+            .sort_values(["AIC","BIC","LogLik"], ascending=[True, True, False]))
+    return df.round(3)
+
+print("=== BTC — Ranking por AIC/BIC/LL ===")
+print(tabla_modelos(modelos_btc))
+print("\n=== ETH — Ranking por AIC/BIC/LL ===")
+print(tabla_modelos(modelos_eth))
+
+
+def print_summaries(modelos_dict, label="", sin_fecha=True):
+    for name, res in modelos_dict.items():
+        print("\n" + "="*90)
+        print(f"{label} | {name}")
+        print("="*90)
+        try:
+            txt = res.summary().as_text()
+            if sin_fecha:
+                # Oculta líneas con Date/Time para que no aparezcan
+                txt = "\n".join(
+                    ln for ln in txt.splitlines()
+                    if not ln.strip().startswith("Date:") and not ln.strip().startswith("Time:")
+                )
+            print(txt)
+        except Exception:
+            # Fallback por si falla el summary
+            print(res)
+
+# --- Imprimir summaries de todos los modelos (BTC y ETH) ---
+print_summaries(modelos_btc, label="BTC", sin_fecha=True)
+print_summaries(modelos_eth, label="ETH", sin_fecha=True)
+
+
+
+# Gráficos de volatilidad por activo
+def plot_vols(modelos_dict, r, titulo):
+    plt.figure(figsize=(12,6))
+    for name, res in modelos_dict.items():
+        vol = pd.Series(res.conditional_volatility, index=r.index)
+        plt.plot(vol, label=name, alpha=0.85, linewidth=1.2)
+    plt.title(f"Volatilidad Condicional — {titulo}")
+    plt.ylabel("Volatilidad (%)"); plt.xlabel("Tiempo")
+    ax = plt.gca()
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    plt.grid(True, linestyle=":", alpha=0.5)
+    plt.legend(ncols=2)
+    plt.tight_layout(); plt.show()
+
+plot_vols(modelos_btc, r_btc, "Bitcoin")
+plot_vols(modelos_eth, r_eth, "Ethereum")
+
+
+
+#
+# 8) ELECCIÓN AUTOMÁTICA DEL MEJOR MODELO (BTC y ETH)
+#     Criterio: (1) todos los coeficientes significativos (excluye 'nu'),
+#               (2) BIC (primario), (3) AIC y LogLik como desempates.
+# =
+
+def ranking_modelos(modelos_dict, alpha=0.05, excluir=("nu",)):
+    filas = []
+    for name, res in modelos_dict.items():
+        # booleano de significancia (excluye 'nu' de la t-Student)
+        p = res.pvalues.copy()
+        for x in excluir:
+            if x in p.index:
+                p = p.drop(x)
+        signif = bool((p < alpha).all())
+
+        filas.append({
+            "Modelo": name,
+            "AIC": res.aic,
+            "BIC": res.bic,
+            "LogLik": res.loglikelihood,
+            "Significativo": signif
+        })
+    df = (pd.DataFrame(filas)
+            .set_index("Modelo")
+            .sort_values(["BIC","AIC","LogLik"], ascending=[True, True, False]))
+    return df.round(6)
+
+def elegir_mejor(modelos_dict, prefer="BIC", alpha=0.05, excluir=("nu",)):
+    prefer = prefer.upper()
+    assert prefer in ("AIC","BIC"), "prefer debe ser 'AIC' o 'BIC'"
+    df = ranking_modelos(modelos_dict, alpha=alpha, excluir=excluir)
+
+    # 1) filtrar por significancia (si hay al menos uno significativo)
+    candidatos = df[df["Significativo"]]
+    if candidatos.empty:
+        candidatos = df.copy()
+        aviso = f"(ningún modelo tiene todos los coeficientes significativos; se elige por {prefer} entre todos)"
+    else:
+        aviso = f"(se elige por {prefer} entre los significativos)"
+
+    # 2) ordenar por preferido, luego por el otro y luego por LogLik
+    segundo = "AIC" if prefer == "BIC" else "BIC"
+    orden = [prefer, segundo, "LogLik"]
+    asc   = [True, True, False]
+    best_name = candidatos.sort_values(orden, ascending=asc).index[0]
+    best_res  = modelos_dict[best_name]
+    return best_name, best_res, df, aviso
+
+def print_summary_no_date(res, title=None):
+    """(ya usada arriba) imprime el summary sin Date/Time."""
+    try:
+        txt = res.summary().as_text()
+        limpio = "\n".join([ln for ln in txt.splitlines()
+                            if ("Date:" not in ln and "Time:" not in ln)])
+        if title: print(f"\n===== {title} — Summary =====")
+        print(limpio)
+    except Exception:
+        if title: print(f"\n===== {title} — Summary (raw) =====")
+        print(res)
+
+def plot_vol(best_res, idx, titulo="Volatilidad condicional (modelo ganador)"):
+    vol = pd.Series(best_res.conditional_volatility,
+                    index=idx[-len(best_res.conditional_volatility):])
+    plt.figure(figsize=(10,4))
+    plt.plot(vol, lw=1.4)
+    plt.title(titulo)
+    plt.ylabel("Volatilidad (%)")
+    plt.grid(True, linestyle=":", alpha=0.6)
+    plt.tight_layout()
+    plt.show()
+
+# --- Ejecutar selección para BTC y ETH ---
+best_btc_name, best_btc_res, rank_btc, aviso_btc = elegir_mejor(modelos_btc, prefer="BIC", alpha=0.05, excluir=("nu",))
+best_eth_name, best_eth_res, rank_eth, aviso_eth = elegir_mejor(modelos_eth, prefer="BIC", alpha=0.05, excluir=("nu",))
+
+print("\n=== BTC — Ranking (con significancia) ===")
+print(rank_btc)
+print(f"\n>>> Mejor BTC: {best_btc_name} {aviso_btc}")
+print_summary_no_date(best_btc_res, title=f"BTC | {best_btc_name}")
+plot_vol(best_btc_res, r_btc.index, titulo=f"BTC — {best_btc_name} (σ̂_t)")
+
+print("\n=== ETH — Ranking (con significancia) ===")
+print(rank_eth)
+print(f"\n>>> Mejor ETH: {best_eth_name} {aviso_eth}")
+print_summary_no_date(best_eth_res, title=f"ETH | {best_eth_name}")
+plot_vol(best_eth_res, r_eth.index, titulo=f"ETH — {best_eth_name} (σ̂_t)")
+
+
+# -Reestimar los ganadores con mean='zero' y comparar vs mean='constant' 
+
+from arch import arch_model
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Asegúrate que existen: r_btc, r_eth (retornos en %), como en tu pipeline anterior.
+
+
+def print_summary_no_date(res, title=None):
+    try:
+        txt = res.summary().as_text()
+        clean = "\n".join([ln for ln in txt.splitlines() if ("Date:" not in ln and "Time:" not in ln)])
+        if title: print(f"\n===== {title} — Summary =====")
+        print(clean)
+    except Exception:
+        if title: print(f"\n===== {title} — Summary (raw) =====")
+        print(res)
+
+def modelo_signif(res, alpha=0.05, excluir=("nu",)):
+    p = res.pvalues.copy()
+    for x in excluir:
+        if x in p.index:
+            p = p.drop(x)
+    return bool((p < alpha).all())
+
+def tabla_comp(res_dict, alpha=0.05, excluir=("nu",)):
+    filas = []
+    for k, r in res_dict.items():
+        filas.append({
+            "Especificación": k,
+            "AIC": r.aic,
+            "BIC": r.bic,
+            "LogLik": r.loglikelihood,
+            "Todos signif.": "Sí" if modelo_signif(r, alpha, excluir) else "No"
+        })
+    df = (pd.DataFrame(filas)
+            .set_index("Especificación")
+            .sort_values(["BIC","AIC","LogLik"], ascending=[True, True, False]))
+    return df.round(6)
+
+def elegir_mejor(df, prefer="BIC"):
+    prefer = prefer.upper()
+    segundo = "AIC" if prefer == "BIC" else "BIC"
+    # si hay modelos significativos, prioriza esos
+    sig = df[df["Todos signif."] == "Sí"]
+    base = sig if not sig.empty else df
+    best = base.sort_values([prefer, segundo, "LogLik"], ascending=[True, True, False]).iloc[0]
+    return best.name
+
+def plot_vol_comparado(res_const, res_zero, idx, titulo="Volatilidad condicional"):
+    v1 = pd.Series(res_const.conditional_volatility, index=idx[-len(res_const.conditional_volatility):])
+    v2 = pd.Series(res_zero.conditional_volatility, index=idx[-len(res_zero.conditional_volatility):])
+    plt.figure(figsize=(10,4))
+    plt.plot(v1, label="mean=constant", lw=1.4, alpha=0.9)
+    plt.plot(v2, label="mean=zero",     lw=1.4, alpha=0.9)
+    plt.title(titulo); plt.ylabel("Volatilidad (%)"); plt.grid(True, linestyle=":", alpha=0.6)
+    plt.legend(); plt.tight_layout(); plt.show()
+
+#  1) BTC — GARCH(1,1) dist=normal
+btc_const = arch_model(r_btc, mean='constant', vol='GARCH', p=1, q=1, dist='normal').fit(disp='off', cov_type='robust')
+btc_zero  = arch_model(r_btc, mean='zero',     vol='GARCH', p=1, q=1, dist='normal').fit(disp='off', cov_type='robust')
+
+tabla_btc = tabla_comp({"GARCH(1,1) normal | mean=constant": btc_const,
+                        "GARCH(1,1) normal | mean=zero":     btc_zero})
+print("\n=== BTC — Comparación mean (GARCH(1,1), dist=normal) ===")
+print(tabla_btc)
+
+best_btc = elegir_mejor(tabla_btc, prefer="BIC")
+print(f"\n>>> BTC: mejor entre mean='constant' y 'zero' → {best_btc}")
+
+# (Opcional) summaries limpios
+print_summary_no_date(btc_const, "BTC | GARCH(1,1) normal | mean=constant")
+print_summary_no_date(btc_zero,  "BTC | GARCH(1,1) normal | mean=zero")
+
+# (Opcional) gráfico de volatilidades comparadas
+plot_vol_comparado(btc_const, btc_zero, r_btc.index, "BTC — GARCH(1,1) normal (mean: constant vs zero)")
+
+#  2) ETH — EGARCH(1,1) dist=t 
+eth_const = arch_model(r_eth, mean='constant', vol='EGARCH', p=1, q=1, dist='t').fit(disp='off', cov_type='robust')
+eth_zero  = arch_model(r_eth, mean='zero',     vol='EGARCH', p=1, q=1, dist='t').fit(disp='off', cov_type='robust')
+
+tabla_eth = tabla_comp({"EGARCH(1,1)-t | mean=constant": eth_const,
+                        "EGARCH(1,1)-t | mean=zero":     eth_zero})
+print("\n=== ETH — Comparación mean (EGARCH(1,1), dist=t) ===")
+print(tabla_eth)
+
+best_eth = elegir_mejor(tabla_eth, prefer="BIC")
+print(f"\n>>> ETH: mejor entre mean='constant' y 'zero' → {best_eth}")
+
+# (Opcional) summaries limpios
+print_summary_no_date(eth_const, "ETH | EGARCH(1,1)-t | mean=constant")
+print_summary_no_date(eth_zero,  "ETH | EGARCH(1,1)-t | mean=zero")
+
+# (Opcional) gráfico de volatilidades comparadas
+plot_vol_comparado(eth_const, eth_zero, r_eth.index, "ETH — EGARCH(1,1)-t (mean: constant vs zero)")
+
+
+
+
+# 
+# Diagnóstico de residuos para los modelos ganadores
+# BTC:  GARCH(1,1)  dist=normal, mean='zero'
+# ETH:  EGARCH(1,1) dist=t,      mean='zero'
+# 
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from arch import arch_model
+from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
+from statsmodels.stats.stattools import jarque_bera
+from statsmodels.graphics.tsaplots import plot_acf
+from statsmodels.graphics.gofplots import qqplot
+from scipy.stats import t as student_t, kstest, norm
+
+ALPHA = 0.05
+LAGS  = [10, 20, 30]
+
+# BTC: dist NORMAL 
+def resid_tests_normal(res, lags=LAGS, label="BTC GARCH(1,1) normal, mean=0", show_plots=True):
+    # Residuos estandarizados (≈N(0,1) si el modelo está bien)
+    e = pd.Series(res.std_resid).dropna()
+    e2 = e**2
+
+    # Ljung–Box en residuos y en residuos al cuadrado
+    lb_e  = acorr_ljungbox(e,  lags=lags, return_df=True)
+    lb_e2 = acorr_ljungbox(e2, lags=lags, return_df=True)
+    lb_e.index  = [f"lag {L}" for L in lags]
+    lb_e2.index = [f"lag {L}" for L in lags]
+
+    # ARCH–LM (sobre e)
+    lm_rows = []
+    for L in lags:
+        lm_stat, lm_p, *_ = het_arch(e, nlags=L)
+        lm_rows.append([L, lm_stat, lm_p])
+    arch_lm = pd.DataFrame(lm_rows, columns=["lag","LM stat","LM pval"]).set_index("lag")
+
+    # Normalidad (Jarque–Bera)
+    jb_stat, jb_p, skew, kurt = jarque_bera(e)
+
+    # Tabla p-values
+    tabla = pd.DataFrame({
+        "LB e  pval":   lb_e["lb_pvalue"].values,
+        "LB e² pval":   lb_e2["lb_pvalue"].values,
+        "ARCH LM pval": arch_lm["LM pval"].reindex(lags).values
+    }, index=[f"lag {L}" for L in lags]).round(4)
+
+    # Plots
+    if show_plots:
+        fig, ax = plt.subplots(1, 3, figsize=(12, 3.8))
+        plot_acf(e,  lags=40, ax=ax[0]); ax[0].set_title("ACF(e)")
+        plot_acf(e2, lags=40, ax=ax[1]); ax[1].set_title("ACF(e²)")
+        qqplot(e, line="s", ax=ax[2]);   ax[2].set_title("QQ vs Normal")
+        plt.suptitle(f"Diagnóstico residuos — {label}")
+        plt.tight_layout(); plt.show()
+
+    print(f"\n=== {label} ===")
+    print(tabla)
+    print(f"\nJarque–Bera normalidad: stat={jb_stat:.2f}, p={jb_p:.4f} (skew={skew:.2f}, kurt={kurt:.2f})")
+    print("Regla: p-valor > 0.05 ⇒ no se rechaza el supuesto (OK).")
+    return tabla, {"JB_p": float(jb_p)}
+
+#  ETH: dist t -
+def resid_tests_t(res, lags=LAGS, label="ETH EGARCH(1,1) t, mean=0", show_plots=True):
+    # Residuos estandarizados (var≈1) bajo t
+    e = pd.Series(res.std_resid).dropna()
+    e2 = e**2
+
+    # Ljung–Box en e y e²
+    lb_e  = acorr_ljungbox(e,  lags=lags, return_df=True)
+    lb_e2 = acorr_ljungbox(e2, lags=lags, return_df=True)
+
+    # ARCH–LM
+    lm_rows = []
+    for L in lags:
+        lm_stat, lm_p, *_ = het_arch(e, nlags=L)
+        lm_rows.append([L, lm_stat, lm_p])
+    arch_lm = pd.DataFrame(lm_rows, columns=["lag","LM stat","LM pval"]).set_index("lag")
+
+    # PIT correcto para t(ν):
+    #   e = T / sqrt(ν/(ν-2))  ⇒  T = e * sqrt(ν/(ν-2))
+    nu = float(res.params["nu"])
+    if nu <= 2:
+        raise ValueError(f"nu={nu:.3f} ≤ 2: la varianza de la t no está definida.")
+    x = e * np.sqrt(nu/(nu-2))
+    u = pd.Series(student_t.cdf(x, df=nu), index=e.index)  # U(0,1) si el modelo está bien
+
+    # KS sobre uniformidad del PIT
+    ks_stat, ks_p = kstest(u, "uniform")
+
+    # Independencia sobre z = Φ^{-1}(u)
+    z   = pd.Series(norm.ppf(np.clip(u, 1e-12, 1-1e-12)), index=e.index)
+    lb_z  = acorr_ljungbox(z,    lags=lags, return_df=True)
+    lb_z2 = acorr_ljungbox(z**2, lags=lags, return_df=True)
+
+    # Tabla p-values
+    tabla = pd.DataFrame({
+        "LB e  pval":   lb_e["lb_pvalue"].values,
+        "LB e² pval":   lb_e2["lb_pvalue"].values,
+        "ARCH LM pval": arch_lm["LM pval"].reindex(lags).values,
+        "LB z  pval":   lb_z["lb_pvalue"].values,
+        "LB z² pval":   lb_z2["lb_pvalue"].values
+    }, index=[f"lag {L}" for L in lags]).round(4)
+
+    # Plots
+    if show_plots:
+        fig, ax = plt.subplots(2, 3, figsize=(13, 7)); ax = ax.ravel()
+        ax[0].plot(e); ax[0].axhline(0, ls="--", lw=0.8)
+        ax[0].set_title("Residuos estandarizados"); ax[0].grid(True, linestyle=":")
+        plot_acf(e,  lags=40, ax=ax[1]); ax[1].set_title("ACF(e)")
+        plot_acf(e2, lags=40, ax=ax[2]); ax[2].set_title("ACF(e²)")
+        qqplot(x, dist=student_t, distargs=(nu,), line="45", ax=ax[3]); ax[3].set_title(f"QQ vs t(ν={nu:.1f})")
+        ax[4].hist(u, bins=30, range=(0,1), density=True); ax[4].set_title("PIT ~ U(0,1)"); ax[4].grid(True, linestyle=":")
+        vol = pd.Series(res.conditional_volatility).dropna()
+        ax[5].plot(vol); ax[5].set_title("Volatilidad condicional σ̂_t"); ax[5].grid(True, linestyle=":")
+        plt.suptitle(f"Diagnóstico de residuos — {label}")
+        plt.tight_layout(); plt.show()
+
+    print(f"\n=== {label} ===")
+    print(tabla)
+    print(f"\nPIT — KS U(0,1): p = {ks_p:.4f}  (p altos ⇒ OK)")
+    print("Regla: p-valor > 0.05 en LB/ARCH/KS ⇒ no evidencia de problemas.")
+    return tabla, {"KS_PIT_p": float(ks_p), "nu": nu}
+
+# Ajustar los modelos ganadores (si no los tienes ya) 
+# r_btc y r_eth deben existir (retornos en %)
+res_btc = arch_model(r_btc, mean='zero', vol='GARCH', p=1, q=1, dist='normal') \
+            .fit(disp='off', cov_type='robust')
+res_eth = arch_model(r_eth, mean='zero', vol='EGARCH', p=1, q=1, dist='t') \
+            .fit(disp='off', cov_type='robust')
+
+# Ejecutar validaciones
+tabla_btc, extra_btc = resid_tests_normal(res_btc, lags=LAGS,
+    label="Bitcoin — GARCH(1,1) normal, mean=0", show_plots=True)
+
+tabla_eth, extra_eth = resid_tests_t(res_eth, lags=LAGS,
+    label="Ethereum — EGARCH(1,1) t, mean=0", show_plots=True)
+
+
+
+am_btc_t = arch_model(r_btc, mean='zero', vol='GARCH', p=1, q=1, dist='t')
+res_btc_t = am_btc_t.fit(disp='off', cov_type='robust')  # robust para inferencia
+print("\n===== BTC | GARCH(1,1) | dist=t | mean=0 — Summary =====")
+print("\n".join([ln for ln in res_btc_t.summary().as_text().splitlines()
+                 if ("Date:" not in ln and "Time:" not in ln)]))
+
+#  Función de validación de residuos para GARCH-t 
+def validar_residuos_garch_t(res, lags=(10,20,30), label="Activo", x_index=None, show_plots=True):
+    # Residuos estandarizados
+    e = pd.Series(res.std_resid).dropna()
+    if x_index is not None and len(x_index) >= len(e):
+        e.index = pd.Index(x_index[-len(e):])
+    e2 = e**2
+
+    # 1) Ljung–Box en e y e^2 (no autocorrelación / no ARCH remanente)
+    lb_e  = acorr_ljungbox(e,  lags=list(lags), return_df=True)
+    lb_e2 = acorr_ljungbox(e2, lags=list(lags), return_df=True)
+
+    # 2) ARCH–LM sobre e
+    lm_rows = []
+    for L in lags:
+        lm_stat, lm_pval, *_ = het_arch(e, nlags=L)
+        lm_rows.append([L, lm_stat, lm_pval])
+    arch_lm = pd.DataFrame(lm_rows, columns=["lag","LM stat","LM pval"]).set_index("lag")
+
+    # 3) PIT con t-Student(ν): u_t ~ U(0,1) si la innov. t está bien especificada
+    nu = float(res.params["nu"])
+    if nu <= 2:
+        raise ValueError(f"nu={nu:.3f} ≤ 2: la varianza de t no está definida.")
+    # e tiene var≈1; para mapear a t-pura: x = e * sqrt(nu/(nu-2))
+    x = e * np.sqrt(nu/(nu-2))
+    u = pd.Series(student_t.cdf(x, df=nu), index=e.index)  # PIT
+    ks_stat, ks_p = kstest(u, "uniform")                   # uniformidad
+
+    #  Independencia adicional: z = Φ^{-1}(u); Ljung–Box en z y z^2
+    z   = pd.Series(norm.ppf(np.clip(u, 1e-12, 1-1e-12)), index=e.index)
+    lb_z  = acorr_ljungbox(z,    lags=list(lags), return_df=True)
+    lb_z2 = acorr_ljungbox(z**2, lags=list(lags), return_df=True)
+
+    # Tabla p-values
+    tabla = pd.DataFrame({
+        "LB e  pval":   lb_e["lb_pvalue"].values,
+        "LB e² pval":   lb_e2["lb_pvalue"].values,
+        "ARCH LM pval": arch_lm["LM pval"].reindex(lags).values,
+        "LB z  pval":   lb_z["lb_pvalue"].values,
+        "LB z² pval":   lb_z2["lb_pvalue"].values
+    }, index=[f"lag {L}" for L in lags]).round(4)
+
+    # Plots
+    if show_plots:
+        fig, ax = plt.subplots(2, 3, figsize=(13, 7))
+        ax = ax.ravel()
+
+        # Residuos e_t
+        ax[0].plot(e); ax[0].axhline(0, ls="--", lw=0.8)
+        ax[0].set_title(f"{label}: residuos estandarizados"); ax[0].grid(True, linestyle=":")
+
+        # ACF(e) y ACF(e^2)
+        plot_acf(e,  lags=40, ax=ax[1]); ax[1].set_title("ACF(e)")
+        plot_acf(e2, lags=40, ax=ax[2]); ax[2].set_title("ACF(e²)")
+
+        # QQ vs t(ν)
+        qqplot(x, dist=student_t, distargs=(nu,), line="45", ax=ax[3])
+        ax[3].set_title(f"QQ vs t(ν={nu:.1f})")
+
+        # Histograma del PIT
+        ax[4].hist(u, bins=30, range=(0,1), density=True)
+        ax[4].set_title("PIT ~ U(0,1)"); ax[4].grid(True, linestyle=":")
+
+        # Volatilidad condicional
+        vol = pd.Series(res.conditional_volatility).dropna()
+        if len(vol) >= len(e):
+            vol = vol.iloc[-len(e):]; vol.index = e.index
+        ax[5].plot(vol); ax[5].set_title("Volatilidad condicional σ̂_t"); ax[5].grid(True, linestyle=":")
+
+        plt.suptitle(f"Diagnóstico de residuos — {label} — GARCH(1,1) t", y=1.02)
+        plt.tight_layout(); plt.show()
+
+    # Print resumen corto
+    print(f"\n=== {label} — Validación de residuos (GARCH(1,1) t, ν={nu:.2f}) ===")
+    print(tabla)
+    print(f"\nPIT — KS U(0,1): p = {ks_p:.4f}  (p altos ⇒ uniformidad OK)\n")
+
+    return tabla, {"KS_PIT_p": float(ks_p), "nu": nu}
+
+#Ejecutar validación para BTC 
+_ = validar_residuos_garch_t(
+    res_btc_t, lags=(10,20,30),
+    label="Bitcoin — GARCH(1,1) t (mean=0)",
+    x_index=r_btc.index, show_plots=True
+)
+
+
+
+# RESIDUAL DIAGNOSTICS (BTC/ETH) 
+import numpy as np, pandas as pd, matplotlib.pyplot as plt
+from arch import arch_model
+from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
+from statsmodels.graphics.tsaplots import plot_acf
+from statsmodels.graphics.gofplots import qqplot
+from statsmodels.stats.stattools import jarque_bera
+from scipy.stats import t as student_t, kstest, norm
+
+# ---- Config ----
+LAGS = [10, 20, 30]
+ALPHA = 0.05
+
+# ---- Helpers ----
+def _lb_arch_tables(e, lags=LAGS):
+    e = pd.Series(e).dropna()
+    e2 = e**2
+    lb_e  = acorr_ljungbox(e,  lags=lags, return_df=True)[["lb_stat","lb_pvalue"]]
+    lb_e2 = acorr_ljungbox(e2, lags=lags, return_df=True)[["lb_stat","lb_pvalue"]]
+    arch_rows = []
+    for L in lags:
+        lm_stat, lm_p, *_ = het_arch(e, nlags=L)
+        arch_rows.append([L, lm_stat, lm_p])
+    arch_lm = pd.DataFrame(arch_rows, columns=["lag","LM stat","LM pval"]).set_index("lag")
+    lb_e.index  = [f"lag {L}" for L in lags]
+    lb_e2.index = [f"lag {L}" for L in lags]
+    return lb_e.round(4), lb_e2.round(4), arch_lm.round(4)
+
+def resid_tests_normal(res, label="Modelo normal", lags=LAGS, show_plots=True):
+    e = pd.Series(res.std_resid).dropna()
+    lb_e, lb_e2, arch_lm = _lb_arch_tables(e, lags=lags)
+    jb_stat, jb_p, skew, kurt = jarque_bera(e)
+
+    print(f"\n=== {label} — GARCH normal ===")
+    print("Ljung–Box en e:")
+    print(lb_e)
+    print("\nLjung–Box en e²:")
+    print(lb_e2)
+    print("\nARCH–LM:")
+    print(arch_lm)
+    print(f"\nJarque–Bera normalidad: stat={jb_stat:.2f}, p={jb_p:.4g} (skew={skew:.2f}, kurt={kurt:.2f})")
+    if show_plots:
+        fig, ax = plt.subplots(2, 3, figsize=(13,7)); ax = ax.ravel()
+        ax[0].plot(e); ax[0].axhline(0, ls="--", lw=0.8); ax[0].set_title("Residuos estandarizados"); ax[0].grid(True, ls=":")
+        plot_acf(e,  lags=40, ax=ax[1]); ax[1].set_title("ACF(e)")
+        plot_acf(e**2, lags=40, ax=ax[2]); ax[2].set_title("ACF(e²)")
+        qqplot(e, line="s", ax=ax[3]); ax[3].set_title("QQ vs Normal")
+        ax[4].hist(e, bins=30, density=True); ax[4].set_title("Hist resid.")
+        vol = pd.Series(res.conditional_volatility).dropna()
+        ax[5].plot(vol.iloc[-len(e):]); ax[5].set_title("Volatilidad condicional"); ax[5].grid(True, ls=":")
+        plt.suptitle(label); plt.tight_layout(); plt.show()
+
+def resid_tests_t(res, label="Modelo t", lags=LAGS, show_plots=True):
+    e = pd.Series(res.std_resid).dropna()
+    lb_e, lb_e2, arch_lm = _lb_arch_tables(e, lags=lags)
+    nu = float(res.params.get("nu", np.nan))
+    # PIT correcto para t (escala a t-pura)
+    x = e * np.sqrt(nu/(nu-2))
+    u = pd.Series(student_t.cdf(x, df=nu), index=e.index)
+    ks_stat, ks_p = kstest(u, "uniform")
+
+    print(f"\n=== {label} — (t, ν={nu:.2f}) ===")
+    print("Ljung–Box en e:")
+    print(lb_e)
+    print("\nLjung–Box en e²:")
+    print(lb_e2)
+    print("\nARCH–LM:")
+    print(arch_lm)
+    print(f"\nPIT KS U(0,1): stat={ks_stat:.3f}, p={ks_p:.4f}  (p alto ⇒ buen ajuste de colas)")
+    if show_plots:
+        from scipy.stats import norm as N
+        fig, ax = plt.subplots(2, 3, figsize=(13,7)); ax = ax.ravel()
+        ax[0].plot(e); ax[0].axhline(0, ls="--", lw=0.8); ax[0].set_title("Residuos estandarizados"); ax[0].grid(True, ls=":")
+        plot_acf(e,  lags=40, ax=ax[1]); ax[1].set_title("ACF(e)")
+        plot_acf(e**2, lags=40, ax=ax[2]); ax[2].set_title("ACF(e²)")
+        qqplot(x, dist=student_t, distargs=(nu,), line="45", ax=ax[3]); ax[3].set_title(f"QQ vs t(ν={nu:.1f})")
+        ax[4].hist(u, bins=30, range=(0,1), density=True); ax[4].set_title("PIT ~ U(0,1)"); ax[4].grid(True, ls=":")
+        vol = pd.Series(res.conditional_volatility).dropna()
+        ax[5].plot(vol.iloc[-len(e):]); ax[5].set_title("Volatilidad condicional"); ax[5].grid(True, ls=":")
+        plt.suptitle(label); plt.tight_layout(); plt.show()
+
+# Asegurar modelos (si no existen, estimar) 
+try:
+    res_btc_norm
+except NameError:
+    res_btc_norm = arch_model(r_btc, mean='zero', vol='GARCH', p=1, q=1, dist='normal') \
+                    .fit(disp='off', cov_type='robust')
+
+try:
+    res_btc_t
+except NameError:
+    res_btc_t = arch_model(r_btc, mean='zero', vol='GARCH', p=1, q=1, dist='t') \
+                  .fit(disp='off', cov_type='robust')
+
+try:
+    res_eth_egarch_t
+except NameError:
+    res_eth_egarch_t = arch_model(r_eth, mean='zero', vol='EGARCH', p=1, q=1, dist='t') \
+                         .fit(disp='off', cov_type='robust')
+
+#  Ejecutar diagnósticos solicitados
+resid_tests_normal(res_btc_norm, label="Bitcoin — GARCH(1,1) normal, mean=0", lags=LAGS, show_plots=True)
+resid_tests_t(res_btc_t,     label="Bitcoin — GARCH(1,1) t, mean=0",       lags=LAGS, show_plots=True)
+resid_tests_t(res_eth_egarch_t, label="Ethereum — EGARCH(1,1) t, mean=0",  lags=LAGS, show_plots=True)
+
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from arch import arch_model
+from scipy.stats import chi2, t as student_t
+from scipy.special import gammaln
+
+#  métricas 
+def qlike(y, s2):
+    s2 = np.maximum(s2, 1e-12)
+    return np.mean(np.log(s2) + (y**2)/s2)
+
+def mse_var(y, s2):
+    return np.mean((y**2 - s2)**2)
+
+def avg_loglik_normal(y, mu, s2):
+    s2 = np.maximum(s2, 1e-12)
+    return np.mean(-0.5*np.log(2*np.pi*s2) - 0.5*((y-mu)**2)/s2)
+
+def avg_loglik_t_point(y, mu, s2, nu):
+    # log-verosimilitud puntual con t-Student (varianza s2 de la innovación)
+    s2 = max(s2, 1e-12)
+    nu = max(nu, 2.001)
+    term1 = gammaln((nu+1)/2) - gammaln(nu/2) - 0.5*np.log((nu-2)*np.pi*s2)
+    term2 = - ((nu+1)/2)*np.log(1 + ((y-mu)**2)/((nu-2)*s2))
+    return term1 + term2
+
+def avg_loglik_t(y, mu, s2, nu):
+    return np.mean([avg_loglik_t_point(float(y[i]), float(mu[i]), float(s2[i]), float(nu[i])) 
+                    for i in range(len(y))])
+
+def dm_test(loss1, loss2, h=1, lag=None):
+    d = (pd.Series(loss1) - pd.Series(loss2)).to_numpy()
+    n = len(d)
+    if lag is None:
+        lag = max(h-1, int(np.sqrt(max(n,1))))
+    eps = 1e-12
+    gamma0 = np.var(d, ddof=1); s = gamma0
+    for L in range(1, lag+1):
+        w = 1 - L/(lag+1)
+        cov = np.cov(d[L:], d[:-L], ddof=1)[0,1] if n > L+1 else 0.0
+        s += 2*w*cov
+    stat = d.mean() / np.sqrt(max(s/n, eps))
+    from scipy import stats
+    p_two = 2*(1 - stats.t.cdf(abs(stat), df=n-1))
+    return stat, p_two
+
+def safe_test_len(r, desired=250):
+    r = pd.Series(r).dropna()
+    return max(30, min(desired, len(r)-60))  # deja >50 obs para training
+
+# ----------------- Wrappers de ajuste (3 modelos) -----------------
+def fit_btc_garch_norm_zero(r):
+    am = arch_model(r, mean='zero', vol='GARCH', p=1, q=1, dist='normal')
+    return am.fit(disp='off', cov_type='robust')
+
+def fit_btc_garch_t_zero(r):
+    am = arch_model(r, mean='zero', vol='GARCH', p=1, q=1, dist='t')
+    return am.fit(disp='off', cov_type='robust')
+
+def fit_eth_egarch_t_zero(r):
+    am = arch_model(r, mean='zero', vol='EGARCH', p=1, q=1, dist='t')
+    return am.fit(disp='off', cov_type='robust')
+
+#  Pronóstico multi-step (10 días) 
+def forecast_10d(res, label=""):
+    vol_name = res.model.volatility.__class__.__name__.upper()
+    is_egarch = vol_name.startswith("EGARCH")
+    method = "simulation" if is_egarch else "analytic"
+    extra = {"simulations": 5000, "random_state": 123} if is_egarch else {}
+    f = res.forecast(horizon=10, method=method, reindex=False, **extra)
+
+    try:
+        mu = f.mean.iloc[-1].to_numpy()
+        mu = np.nan_to_num(mu, nan=0.0)
+    except Exception:
+        mu = np.zeros(10)
+
+    sigma2 = f.variance.iloc[-1].to_numpy()
+    out = pd.DataFrame({"mu": mu, "sigma2": sigma2},
+                       index=pd.RangeIndex(1, 11, name="h"))
+    print(f"\n=== Pronóstico 10 días — {label} ===")
+    print(out.round(6))
+
+    plt.figure(figsize=(6, 3.2))
+    plt.plot(np.sqrt(out["sigma2"]), marker="o")
+    plt.title(f"{label}: σ̂ (t+1 … t+10)")
+    plt.ylabel("Volatilidad (%)")
+    plt.xlabel("Horizonte (días)")
+    plt.grid(True, linestyle=":")
+    plt.tight_layout()
+    plt.show()
+    return out
+
+#  Estabilidad (Wald mitad/mitad) 
+def _cov_matrix_or_diag(res):
+    C = getattr(res, "param_cov", None)
+    if C is None:
+        se = res.std_err.values
+        C = pd.DataFrame(np.diag(se**2), index=res.params.index, columns=res.params.index)
+    return C
+
+def wald_stability_split(r, fit_func, split=0.5, excluir=('nu',)):
+    r = pd.Series(r).dropna()
+    n = len(r); t0 = int(n*split)
+    res1 = fit_func(r.iloc[:t0])
+    res2 = fit_func(r.iloc[t0:])
+
+    P1, P2 = res1.params, res2.params
+    C1, C2 = _cov_matrix_or_diag(res1), _cov_matrix_or_diag(res2)
+    # intersección de parámetros (mismo orden)
+    names = [nm for nm in P1.index if nm in P2.index and nm not in excluir]
+    θ1 = P1.loc[names].to_numpy(float);  θ2 = P2.loc[names].to_numpy(float)
+    V1 = C1.loc[names, names].to_numpy(float); V2 = C2.loc[names, names].to_numpy(float)
+
+    d = θ1 - θ2
+    S = V1 + V2
+    try:
+        W = float(d.T @ np.linalg.inv(S) @ d)
+    except np.linalg.LinAlgError:
+        # regularización si la cov es singular
+        W = float(d.T @ np.linalg.pinv(S) @ d)
+    df = len(names)
+    p  = 1 - chi2.cdf(W, df=df)
+    return {"W": W, "df": df, "p": p, "params_compared": names}
+
+#  OOS 1-paso rolling con re-estimación 
+def oos_eval(r, fit_func, dist='normal', test_len=250, is_egarch=False, verbose=True):
+    r = pd.Series(r).dropna()
+    n = len(r); n_train = n - test_len
+    assert n_train > 50, "Muy poco training; reduce test_len."
+    idx_test = r.index[n_train:]
+    y_test   = r.iloc[n_train:].to_numpy()
+
+    mu_hat, s2_hat, nu_hat = [], [], []
+    for t in range(n_train, n):
+        r_tr = r.iloc[:t]
+        res  = fit_func(r_tr)
+        method = "simulation" if is_egarch else "analytic"
+        extra  = {"simulations": 2000, "random_state": 123} if is_egarch else {}
+        f = res.forecast(horizon=1, method=method, reindex=False, **extra)
+
+        # media condicional
+        try:
+            mu_hat.append(float(f.mean.iloc[-1, 0]))
+        except Exception:
+            mu_hat.append(0.0)
+
+        s2_hat.append(float(f.variance.iloc[-1, 0]))
+        nu_hat.append(float(res.params["nu"]) if ("nu" in res.params.index) else np.nan)
+
+    mu_hat = np.array(mu_hat); s2_hat = np.array(s2_hat); nu_hat = np.array(nu_hat)
+
+    # métricas
+    met = {
+        "QLIKE":   qlike(y_test, s2_hat),
+        "MSEvar":  mse_var(y_test, s2_hat),
+        "avgLL":   (avg_loglik_t(y_test, mu_hat, s2_hat, nu_hat) 
+                    if dist=='t' else avg_loglik_normal(y_test, mu_hat, s2_hat)),
+    }
+    if verbose:
+        print("\n=== OOS (rolling 1-step) ===")
+        print(pd.Series(met).round(6))
+        print("↓ mejor: QLIKE, MSEvar  |  ↑ mejor: avgLL")
+
+    df = pd.DataFrame({
+        "y": y_test, "mu_hat": mu_hat, "sigma2_hat": s2_hat, "nu_hat": nu_hat
+    }, index=idx_test)
+    return df, met
+
+def plot_oos_sigma(df, titulo=""):
+    plt.figure(figsize=(11,4))
+    plt.plot(np.sqrt(df["sigma2_hat"]), lw=1.4)
+    plt.title(f"{titulo} — σ̂ (rolling 1-step OOS)")
+    plt.ylabel("Volatilidad (%)")
+    plt.grid(True, linestyle=":")
+    plt.tight_layout(); plt.show()
+
+# EJECUCIÓN: AJUSTE, PRONÓSTICO, ESTABILIDAD, OOS 
+#  Ajustar los tres modelos sobre todo el in-sample
+res_btc_norm = fit_btc_garch_norm_zero(r_btc)
+res_btc_t    = fit_btc_garch_t_zero(r_btc)
+res_eth_eg_t = fit_eth_egarch_t_zero(r_eth)
+
+#  Pronóstico a 10 días (in-sample final)
+_ = forecast_10d(res_btc_norm, label="BTC | GARCH(1,1) normal (mean=0)")
+_ = forecast_10d(res_btc_t,    label="BTC | GARCH(1,1) t (mean=0)")
+_ = forecast_10d(res_eth_eg_t, label="ETH | EGARCH(1,1) t (mean=0)")
+
+# 3) Prueba de estabilidad (Wald entre mitades)
+wald_btc_norm = wald_stability_split(r_btc, fit_btc_garch_norm_zero, excluir=('nu',))
+wald_btc_t    = wald_stability_split(r_btc, fit_btc_garch_t_zero,    excluir=('nu',))
+wald_eth_eg   = wald_stability_split(r_eth, fit_eth_egarch_t_zero,   excluir=('nu',))
+print("\n=== Estabilidad (Wald mitad/mitad) ===")
+print(f"BTC GARCH(1,1) normal: W={wald_btc_norm['W']:.3f}, df={wald_btc_norm['df']}, p={wald_btc_norm['p']:.4f}")
+print(f"BTC GARCH(1,1)   t   : W={wald_btc_t['W']:.3f}, df={wald_btc_t['df']}, p={wald_btc_t['p']:.4f}")
+print(f"ETH EGARCH(1,1)  t   : W={wald_eth_eg['W']:.3f}, df={wald_eth_eg['df']}, p={wald_eth_eg['p']:.4f}")
+print("p alto ⇒ parámetros estables entre mitades.")
+
+#  Fuera de muestra (rolling 1-step, re-estimando)
+TEST_LEN_BTC = safe_test_len(r_btc, desired=250)
+TEST_LEN_ETH = safe_test_len(r_eth, desired=250)
+
+# BTC: normal vs t
+oos_btc_norm_df, oos_btc_norm_met = oos_eval(r_btc, fit_btc_garch_norm_zero, dist='normal',
+                                             test_len=TEST_LEN_BTC, is_egarch=False, verbose=True)
+plot_oos_sigma(oos_btc_norm_df, "BTC | GARCH(1,1) normal")
+
+oos_btc_t_df, oos_btc_t_met = oos_eval(r_btc, fit_btc_garch_t_zero, dist='t',
+                                       test_len=TEST_LEN_BTC, is_egarch=False, verbose=True)
+plot_oos_sigma(oos_btc_t_df, "BTC | GARCH(1,1) t")
+
+# ETH: EGARCH t
+oos_eth_eg_df, oos_eth_eg_met = oos_eval(r_eth, fit_eth_egarch_t_zero, dist='t',
+                                         test_len=TEST_LEN_ETH, is_egarch=True, verbose=True)
+plot_oos_sigma(oos_eth_eg_df, "ETH | EGARCH(1,1) t")
+
+#  Comparación BTC (DM sobre QLIKE: normal vs t)
+loss_norm = np.log(oos_btc_norm_df["sigma2_hat"]) + (oos_btc_norm_df["y"]**2)/oos_btc_norm_df["sigma2_hat"]
+loss_t    = np.log(oos_btc_t_df["sigma2_hat"])    + (oos_btc_t_df["y"]**2)/oos_btc_t_df["sigma2_hat"]
+dm_stat, dm_p = dm_test(loss_norm, loss_t, h=1)
+print(f"\n=== Diebold–Mariano (BTC, QLIKE: normal − t) ===  stat={dm_stat:.3f}, p={dm_p:.4f}")
+print("(p pequeño ⇒ diferencia significativa; stat>0 ⇒ normal peor que t)")
+
+#  Resumen métrico final
+print("\n=== Resumen OOS — BTC ===")
+print(pd.DataFrame([oos_btc_norm_met, oos_btc_t_met], 
+                   index=["GARCH(1,1) normal", "GARCH(1,1) t"]).round(6))
+print("\n=== Resumen OOS — ETH ===")
+print(pd.DataFrame([oos_eth_eg_met], index=["EGARCH(1,1) t"]).round(6))
+
+
+
+
+
+
+#########m movimiento geometrico browniano############
+
+
+
+
+# GBM desde el último dato de 2023
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# --- 1) Utilidades ---
+def last_close_2023(df):
+    """Devuelve (S0, t0) = último precio y fecha <= 2023-12-31."""
+    s = df["close"].dropna().copy()
+    s_2023 = s.loc[:'2022-12-31']
+    if s_2023.empty:
+        raise ValueError("No hay datos <= 2023-12-31.")
+    return float(s_2023.iloc[-1]), s_2023.index[-1]
+
+def estimate_gbm_params(logret_series):
+    """
+    Estima parámetros diarios del GBM.
+    Si r_t = ln(S_t/S_{t-1}) ~ N((μ - 0.5σ^2), σ^2),
+    entonces: μ̂ = mean(r) + 0.5*var(r),  σ̂ = sqrt(var(r)).
+    """
+    r = pd.Series(logret_series).dropna()
+    m = r.mean()
+    v = r.var(ddof=1)
+    mu_hat = float(m + 0.5*v)
+    sigma_hat = float(np.sqrt(v))
+    return mu_hat, sigma_hat
+
+def simulate_gbm_paths(S0, mu, sigma, n_steps, n_paths=10000, dt=1.0, seed=42):
+    """
+    Simula trayectorias de GBM con paso diario (dt=1).
+    S_{t+1} = S_t * exp((μ - 0.5σ^2)dt + σ*sqrt(dt)*Z),  Z~N(0,1)
+    Devuelve matriz (n_steps+1, n_paths), incluyendo S0 en t=0.
+    """
+    rng = np.random.default_rng(seed)
+    drift = (mu - 0.5*sigma**2) * dt
+    diffusion = sigma * np.sqrt(dt)
+    Z = rng.standard_normal((n_steps, n_paths))
+    log_incr = drift + diffusion * Z
+    log_path = np.cumsum(log_incr, axis=0)
+    S_paths = S0 * np.exp(log_path)
+    S_paths = np.vstack([np.full(n_paths, S0), S_paths])
+    return S_paths
+
+def summarize_paths(S_paths, dates, label="Activo"):
+    """
+    Muestra fan chart y devuelve tabla con cuantiles/mediana/mean
+    para horizontes clave.
+    """
+    # Percentiles por fecha (sobre ejes = paths)
+    percs = np.percentile(S_paths, [5,25,50,75,95], axis=1).T  # shape: (steps+1, 5)
+    p5, p25, p50, p75, p95 = percs[:,0], percs[:,1], percs[:,2], percs[:,3], percs[:,4]
+    mean_path = S_paths.mean(axis=1)
+
+    # --- Gráfico (fan chart) ---
+    plt.figure(figsize=(11,5))
+    plt.fill_between(dates, p5,  p95, alpha=0.15, label="5–95%")
+    plt.fill_between(dates, p25, p75, alpha=0.25, label="25–75%")
+    plt.plot(dates, p50, lw=1.8, label="Mediana")
+    plt.plot(dates, mean_path, lw=1.2, ls="--", label="Media")
+    # Traza algunas trayectorias para contexto
+    for k in range(min(10, S_paths.shape[1])):  # 10 paths
+        plt.plot(dates, S_paths[:,k], lw=0.6, alpha=0.35)
+    plt.title(f"{label} — Simulación GBM (fan chart)")
+    plt.ylabel("Precio simulado"); plt.xlabel("Fecha")
+    plt.grid(True, linestyle=":", alpha=0.6); plt.legend()
+    plt.tight_layout(); plt.show()
+
+    #  Tabla de horizontes 
+    horizons = [10, 30, 90, 252]
+    horizons = [h for h in horizons if h < len(dates)]  # dentro del rango
+    rows = []
+    for h in horizons:
+        dist_h = S_paths[h, :]
+        rows.append({
+            "Horizonte (días)": h,
+            "Media":   float(np.mean(dist_h)),
+            "Mediana": float(np.median(dist_h)),
+            "P5":      float(np.percentile(dist_h, 5)),
+            "P25":     float(np.percentile(dist_h, 25)),
+            "P75":     float(np.percentile(dist_h, 75)),
+            "P95":     float(np.percentile(dist_h, 95)),
+        })
+    tabla = pd.DataFrame(rows).set_index("Horizonte (días)").round(4)
+    print(f"\n=== Resumen distribución — {label} ===")
+    print(tabla)
+    return tabla
+
+# --- 2) Parámetros y punto de partida (último dato de 2023) ---
+S0_btc, t0_btc = last_close_2023(df_btc)
+S0_eth, t0_eth = last_close_2023(df_eth)
+
+btc_log_upto = btc_log_returns.loc[:t0_btc]
+eth_log_upto = eth_log_returns.loc[:t0_eth]
+
+mu_btc, sigma_btc = estimate_gbm_params(btc_log_upto)
+mu_eth, sigma_eth = estimate_gbm_params(eth_log_upto)
+
+print("Parámetros diarios estimados (GBM):")
+print(f"BTC: mu={mu_btc:.6f}, sigma={sigma_btc:.6f}  |  último 2023: {t0_btc.date()}  S0={S0_btc:.2f}")
+print(f"ETH: mu={mu_eth:.6f}, sigma={sigma_eth:.6f}  |  último 2023: {t0_eth.date()}  S0={S0_eth:.2f}")
+
+# --- 3) Simulación ---
+HORIZON_DAYS = 252        # ~1 año hábil
+N_PATHS = 10000
+SEED = 123
+
+paths_btc = simulate_gbm_paths(S0_btc, mu_btc, sigma_btc, HORIZON_DAYS, N_PATHS, dt=1.0, seed=SEED)
+paths_eth = simulate_gbm_paths(S0_eth, mu_eth, sigma_eth, HORIZON_DAYS, N_PATHS, dt=1.0, seed=SEED)
+
+# Índices de fechas (
+dates_btc = pd.bdate_range(start=t0_btc, periods=HORIZON_DAYS+1, freq="B")
+dates_eth = pd.bdate_range(start=t0_eth, periods=HORIZON_DAYS+1, freq="B")
+
+# --- 4) Gráficos +  resumen 
+tabla_btc = summarize_paths(paths_btc, dates_btc, label="BTC (GBM)")
+tabla_eth = summarize_paths(paths_eth, dates_eth, label="ETH (GBM)")
+
+# (Opcional) expectativas cerradas a T días: E[S_T] = S0 * exp(μ T)
+def expected_price_closed_form(S0, mu, T):
+    return float(S0 * np.exp(mu * T))
+
+print("\nExpectativa teórica a 252 días (media GBM cerrada):")
+print(f"BTC: {expected_price_closed_form(S0_btc, mu_btc, 252):.2f}")
+print(f"ETH: {expected_price_closed_form(S0_eth, mu_eth, 252):.2f}")
+
+#######heston
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+#  Inicial
+
+def load_crypto_csv(path_csv: str) -> pd.DataFrame:
+    """
+    Lee csv con separador ';' y columnas date, close en formato latino.
+    Admite alias 'fecha'->'date', 'precio'->'close'.
+    """
+    df = pd.read_csv(path_csv, sep=";")
+    df.columns = df.columns.str.strip().str.lower()
+    if 'fecha' in df.columns and 'date' not in df.columns:
+        df = df.rename(columns={'fecha': 'date'})
+    if 'precio' in df.columns and 'close' not in df.columns:
+        df = df.rename(columns={'precio': 'close'})
+    # limpia precio latino ($, miles con punto y decimales con coma)
+    df['close'] = (df['close'].astype(str)
+                               .str.replace('$', '', regex=False)
+                               .str.replace('.', '', regex=False)   # miles
+                               .str.replace(',', '.', regex=False)) # decimales
+    df['close'] = pd.to_numeric(df['close'], errors='coerce')
+    df['date']  = pd.to_datetime(df['date'], dayfirst=True, errors='coerce')
+    df = df.dropna(subset=['date','close']).set_index('date').sort_index()
+    return df[['close']]
+
+def calibrate_mu_sigma(df: pd.DataFrame, cutoff="2022-12-31"):
+    """
+    μ y σ diarios a partir de retornos log hasta cutoff; S0 al cierre de cutoff.
+    """
+    cutoff = pd.Timestamp(cutoff)
+    r = np.log(df[df.index <= cutoff]['close']).diff().dropna().values
+    mu_d = float(np.mean(r))
+    sigma_d = float(np.std(r, ddof=1))
+    S0 = float(df[df.index <= cutoff]['close'].iloc[-1])
+    return dict(mu_d=mu_d, sigma_d=sigma_d, S0=S0, cutoff=cutoff)
+
+
+#  SIMULACIÓN HESTON 
+
+
+def simulate_heston_paths(
+    S0: float,
+    mu_d: float,
+    kappa: float = 2.0,
+    theta: float = 0.04,
+    xi: float = 0.5,
+    rho: float = -0.7,
+    v0: float = 0.04,
+    n_days: int = 365,
+    n_paths: int = 1000,
+    seed: int = 42
+):
+    """
+    Heston (mundo real):
+      dS_t = μ S_t dt + sqrt(v_t) S_t dW1_t
+      dv_t = κ(θ - v_t) dt + ξ sqrt(v_t) dW2_t,  corr(dW1,dW2)=ρ
+    Esquema Euler con 'full truncation' para mantener v_t >= 0.
+    dt = 1/365 (diario).
+    """
+    rng = np.random.default_rng(seed)
+    dt = 1.0/365.0
+    sqrt_dt = np.sqrt(dt)
+
+    # shocks correlacionados
+    Z1 = rng.standard_normal((n_days, n_paths))
+    Z2 = rng.standard_normal((n_days, n_paths))
+    Z2 = rho*Z1 + np.sqrt(1-rho**2)*Z2
+
+    S = np.empty((n_days+1, n_paths)); S[0,:] = S0
+    v = np.empty((n_days+1, n_paths)); v[0,:] = max(v0, 1e-8)
+
+    for t in range(n_days):
+        v_t = np.maximum(v[t,:], 0.0)  # full truncation
+        # varianza
+        v[t+1,:] = (v[t,:] + kappa*(theta - v_t)*dt + xi*np.sqrt(v_t)*sqrt_dt*Z2[t,:])
+        v[t+1,:] = np.maximum(v[t+1,:], 0.0)
+        # precio (μ en mundo real)
+        S[t+1,:] = S[t,:] * np.exp((mu_d - 0.5*v_t)*dt + np.sqrt(v_t)*sqrt_dt*Z1[t,:])
+
+    return S, v
+
+
+#  RESÚMENES, COBERTURA Y GRÁFICOS
+
+
+def summarize_paths_generic(paths: np.ndarray, cutoff="2022-12-31"):
+    """
+    Resumen (mean, p05, p50, p95) usando exactamente las filas de 'paths'.
+    Índice: [cutoff] + n_steps días consecutivos.
+    """
+    n_rows = paths.shape[0]  # n_steps + 1
+    p05, p50, p95 = np.percentile(paths, [5, 50, 95], axis=1)
+    mean_path = paths.mean(axis=1)
+    cutoff_ts = pd.Timestamp(cutoff)
+    idx = pd.date_range(cutoff_ts, periods=n_rows, freq="D")
+    return pd.DataFrame({"mean": mean_path, "p05": p05, "p50": p50, "p95": p95}, index=idx)
+
+def coverage_band(summary: pd.DataFrame, df_obs_2023: pd.DataFrame):
+    """
+    % dentro de [P5,P95], por debajo y por encima para 2023 (intersección de fechas).
+    """
+    idx = summary.index.intersection(df_obs_2023.index)
+    obs = df_obs_2023.loc[idx, 'close'].values
+    p05 = summary.loc[idx, 'p05'].values
+    p95 = summary.loc[idx, 'p95'].values
+    inside = ((obs >= p05) & (obs <= p95)).mean()
+    below  = (obs < p05).mean()
+    above  = (obs > p95).mean()
+    return inside, below, above
+
+def plot_fanchart(name, paths, summary, df_obs_2023, n_show=120):
+    """
+    Fan-chart con una muestra de trayectorias, mediana y banda P5–P95 + observado.
+    """
+    n_show = min(n_show, paths.shape[1])
+    idx_show = np.linspace(0, paths.shape[1]-1, n_show, dtype=int)
+
+    plt.figure(figsize=(10,4))
+    plt.plot(summary.index.values, paths[:, idx_show], linewidth=0.5, alpha=0.25)
+    plt.plot(summary.index.values, summary['p50'].values, linewidth=2.0, label="Mediana")
+    plt.fill_between(summary.index.values, summary['p05'].values, summary['p95'].values,
+                     alpha=0.20, label="Banda P5–P95")
+    if df_obs_2023 is not None and not df_obs_2023.empty:
+        plt.plot(df_obs_2023.index.values, df_obs_2023['close'].values, linewidth=1.5, label="Observado 2023")
+    plt.title(f"{name} — Heston (μ real), 1000 trayectorias, P5–P95 y observado")
+    plt.xlabel("Fecha"); plt.ylabel("Precio"); plt.legend()
+    plt.grid(True, linestyle="--", alpha=0.25); plt.tight_layout(); plt.show()
+
+# =========================================
+# 4) VOLATILIDAD: RV vs E[v]·dt Y TESTS
+# =========================================
+
+def realized_variance_from_df(df, start="2023-01-01", end="2023-12-31"):
+    """
+    Retornos y varianza realizada (r^2) para el periodo 2023.
+    """
+    df_obs = df[(df.index >= start) & (df.index <= end)]
+    r = np.diff(np.log(df_obs['close'].values))
+    rv = r**2
+    return r, rv, df_obs.index[1:]
+
+def heston_forecast_variance_from_paths(var_paths, dt=1/365.0):
+    """
+    Varianza pronosticada diaria como E[v_t]·dt (alineada a retornos: sin el primer día).
+    """
+    v_mean = var_paths.mean(axis=1)       # (n_days+1,)
+    fvar = v_mean[1:] * dt                # alinear con r_t
+    return fvar
+
+def qlike(rv, fvar):
+    eps = 1e-12
+    ratio = rv/(fvar+eps)
+    return float(np.mean(ratio - np.log(ratio) - 1.0))
+
+def msevar(rv, fvar):
+    return float(np.mean((rv - fvar)**2))
+
+def jarque_bera(x):
+    x = np.asarray(x); n = x.size
+    m = x.mean(); s2 = x.var()
+    if s2 == 0: return np.nan, np.nan, np.nan, np.nan
+    z = (x - m)/np.sqrt(s2)
+    skew = np.mean(z**3); kurt = np.mean(z**4)
+    jb = n/6.0 * (skew**2 + (kurt - 3.0)**2 / 4.0)
+    try:
+        from scipy.stats import chi2
+        p  = 1 - chi2.cdf(jb, 2)
+    except Exception:
+        # aprox normal del chi2 (fallback)
+        mu, sigma = 2, np.sqrt(4)
+        z = (jb - mu)/sigma
+        p = 2*(1 - 0.5*(1+np.math.erf(abs(z)/np.sqrt(2))))
+    return jb, p, skew, kurt
+
+def ljung_box(x, lags=10):
+    x = np.asarray(x) - np.mean(x)
+    n = x.size
+    acf = [np.sum(x[:-k]*x[k:]) / np.sum(x**2) for k in range(1, lags+1)]
+    acf = np.array(acf)
+    Q = n*(n+2)*np.sum((acf**2)/(n - np.arange(1,lags+1)))
+    try:
+        from scipy.stats import chi2
+        p = 1 - chi2.cdf(Q, lags)
+    except Exception:
+        mu, sigma = lags, np.sqrt(2*lags)
+        z = (Q-mu)/sigma
+        p = 2*(1 - 0.5*(1+np.math.erf(abs(z)/np.sqrt(2))))
+    return Q, p
+
+def eval_heston_vol(name, heston_obj):
+    """
+    Evalúa volatilidad: QLIKE, MSEvar, LB y JB sobre residuos (RV - fvar).
+    Grafica RV vs var. Heston.
+    """
+    df = heston_obj['df']
+    var_paths = heston_obj['var_paths']
+    dt = 1/365.0
+
+    # RV observada 2023
+    r, rv, idx_r = realized_variance_from_df(df)
+    # Var. Heston
+    fvar = heston_forecast_variance_from_paths(var_paths, dt=dt)
+
+    # alinear longitudes
+    n = min(len(rv), len(fvar))
+    rv = rv[:n]; fvar = fvar[:n]; r = r[:n]; idx_r = idx_r[:n]
+
+    # métricas
+    mql = qlike(rv, fvar)
+    mmse = msevar(rv, fvar)
+
+    # Diagnóstico de residuos
+    u = rv - fvar
+    Q10, p10 = ljung_box(u, lags=10)
+    Q20, p20 = ljung_box(u, lags=20)
+    jb, pjb, skew, kurt = jarque_bera(u)
+
+    print(f"\n=== {name} | Volatilidad Heston vs Realizada (2023) ===")
+    print(f"QLIKE={mql:.6f} | MSEvar={mmse:.8f}")
+    print(f"Ljung-Box resid (lag10) p={p10:.4f} | (lag20) p={p20:.4f}")
+    print(f"JB residuos p={pjb:.4f} | skew={skew:.3f} | kurt={kurt:.3f}")
+
+    # gráfico RV vs fvar
+    plt.figure(figsize=(10,4))
+    plt.plot(idx_r, rv, label="RV (r^2) observada", linewidth=1.0)
+    plt.plot(idx_r, fvar, label="Var. pronosticada Heston (E[v]·dt)", linewidth=1.5)
+    plt.title(f"{name} — Varianza diaria: observada vs Heston")
+    plt.xlabel("Fecha"); plt.ylabel("Varianza")
+    plt.legend(); plt.grid(True, linestyle="--", alpha=0.3); plt.tight_layout(); plt.show()
+
+    return dict(idx=idx_r, rv=rv, fvar=fvar,
+                QLIKE=mql, MSEvar=mmse,
+                LB10_p=p10, LB20_p=p20, JB_p=pjb)
+
+
+### HESTON ESTÁNDAR (PARÁMETROS X  DEFAULT)
+
+
+def run_heston_symbol(name, path_csv, params_heston=None, seed=777):
+    """
+    Simula Heston con parámetros estándar y grafica fan chart + cobertura.
+    """
+    df = load_crypto_csv(path_csv)
+    cal = calibrate_mu_sigma(df, cutoff="2022-12-31")
+    S0, mu_d, sigma_d = cal["S0"], cal["mu_d"], cal["sigma_d"]
+    v0 = sigma_d**2  # varianza inicial de datos pre-2023
+
+    if params_heston is None:
+        params_heston = dict(kappa=2.0, theta=0.04, xi=0.5, rho=-0.7)
+
+    print(f"=== {name} | Heston (μ real) — parámetros estándar ===")
+    print(f"S0={S0:,.2f} | μ_d={mu_d:.6f} | σ_d={sigma_d:.6f} | v0={v0:.6f}")
+    print(f"Parámetros: κ={params_heston['kappa']}, θ={params_heston['theta']}, ξ={params_heston['xi']}, ρ={params_heston['rho']}")
+
+    # simular 2023 (forzamos 365 días)
+    paths, var_paths = simulate_heston_paths(
+        S0=S0, mu_d=mu_d, v0=v0,
+        kappa=params_heston['kappa'],
+        theta=params_heston['theta'],
+        xi=params_heston['xi'],
+        rho=params_heston['rho'],
+        n_days=365, n_paths=1000, seed=seed
+    )
+    summary = summarize_paths_generic(paths, cutoff="2022-12-31")
+    summary.to_csv(f"heston_{name.lower()}_2023_summary.csv", index=True)
+
+    # observado 2023
+    df_obs_2023 = df[(df.index >= "2023-01-01") & (df.index <= "2023-12-31")]
+
+    # cobertura
+    inside, below, above = coverage_band(summary, df_obs_2023)
+    print(f"Cobertura P5–P95: inside={inside:.3f} | below={below:.3f} | above={above:.3f}")
+
+    # GRAFICO
+    plot_fanchart(name, paths, summary, df_obs_2023, n_show=120)
+
+    return dict(df=df, cal=cal, params=params_heston|dict(v0=v0),
+                paths=paths, var_paths=var_paths, summary=summary)
+
+
+# OPTIMIZACIÓN POR EVOLUCIÓN DIFERENCIAL (DE)
+
+
+from scipy.optimize import differential_evolution
+
+def objective_heston_de(theta_vec, S0, mu_d, r, seed=123, n_paths=300):
+    """
+    theta_vec = [kappa, theta, xi, rho, v0]
+    Devuelve QLIKE entre RV (de r) y varianza pronosticada por Heston.
+    Penaliza violación de Feller: 2*kappa*theta < xi^2
+    """
+    kappa, theta, xi, rho, v0 = theta_vec
+    # penalización Feller (suave)
+    penalty = 0.0
+    if 2*kappa*theta < xi**2:
+        penalty += 100.0 * (xi**2 - 2*kappa*theta)
+
+    # simular exactamente n_days = len(r)
+    n_days = len(r)
+    paths, var_paths = simulate_heston_paths(
+        S0=S0, mu_d=mu_d, kappa=kappa, theta=theta, xi=xi, rho=rho, v0=v0,
+        n_days=n_days, n_paths=n_paths, seed=seed
+    )
+    dt = 1/365.0
+    fvar = heston_forecast_variance_from_paths(var_paths, dt=dt)  # (n_days,)
+    rv = (r[:n_days])**2
+    n = min(len(rv), len(fvar))
+    loss = qlike(rv[:n], fvar[:n]) + penalty
+    return loss
+
+def fit_heston_by_de_symbol(name, df, cutoff="2022-12-31", seed=2024, n_paths=300):
+    """
+    Calibra Heston por DE (min Mse), re-simula con parámetros óptimos,
+    GRAFICA fan chart y RV vs var. pronosticada, y guarda resumen CSV.
+    """
+    # datos observados 2023
+    r, rv, idx = realized_variance_from_df(df)
+    # parámetros base (pre-2023)
+    cal = calibrate_mu_sigma(df, cutoff=cutoff)
+    S0, mu_d, sigma_d = cal["S0"], cal["mu_d"], cal["sigma_d"]
+
+    bounds = [
+        (0.01, 8.0),     # kappa
+        (1e-6, 0.25),    # theta
+        (0.01, 2.0),     # xi
+        (-0.99, 0.99),   # rho
+        (1e-6, 0.25),    # v0
+    ]
+
+    def obj_wrap(theta_vec):
+        return objective_heston_de(theta_vec, S0, mu_d, r, seed=seed, n_paths=n_paths)
+
+    result = differential_evolution(
+        obj_wrap, bounds=bounds, strategy="best1bin",
+        maxiter=40, popsize=12, tol=1e-6, polish=True, seed=seed
+    )
+    theta_hat = result.x
+    print(f"\n=== {name} | Heston calibrado por DE (min QLIKE) ===")
+    print(f"kappa={theta_hat[0]:.4f}, theta={theta_hat[1]:.6f}, xi={theta_hat[2]:.4f}, rho={theta_hat[3]:.4f}, v0={theta_hat[4]:.6f}")
+    print(f"QLIKE* = {result.fun:.6f} | nfev={result.nfev} | success={result.success}")
+
+    # Re-estimacion con parámetros óptimos 
+    n_days = len(r)  # asegura consistencia con RV
+    paths_opt, var_opt = simulate_heston_paths(
+        S0=S0, mu_d=mu_d,
+        kappa=theta_hat[0], theta=theta_hat[1], xi=theta_hat[2], rho=theta_hat[3], v0=theta_hat[4],
+        n_days=n_days, n_paths=1000, seed=seed+1
+    )
+
+    # resumen exacto según número de filas de paths_opt
+    summary_opt = summarize_paths_generic(paths_opt, cutoff=cutoff)
+    summary_opt.to_csv(f"heston_{name.lower()}_2023_summary_opt.csv", index=True)
+
+    # métricas finales de varianza
+    dt = 1/365.0
+    fvar_opt = heston_forecast_variance_from_paths(var_opt, dt=dt)
+    n = min(len(rv), len(fvar_opt))
+    Q = qlike(rv[:n], fvar_opt[:n])
+    M = msevar(rv[:n], fvar_opt[:n])
+    print(f"{name} Post-calibración: QLIKE={Q:.6f} | MSEvar={M:.8f}")
+
+    #  optimizado + observado
+    df_obs_2023 = df[(df.index >= "2023-01-01") & (df.index <= "2023-12-31")]
+    plot_fanchart(f"{name} (DE óptimo)", paths_opt, summary_opt, df_obs_2023, n_show=120)
+
+    # gráfico RV vs varianza Heston optimizada
+    plt.figure(figsize=(10,4))
+    plt.plot(idx[:n], rv[:n], label="RV (r^2) observada", linewidth=1.0)
+    plt.plot(idx[:n], fvar_opt[:n], label="Var. Heston (DE óptimo)", linewidth=1.5)
+    plt.title(f"{name} — Varianza observada vs Heston (DE óptimo)")
+    plt.xlabel("Fecha"); plt.ylabel("Varianza")
+    plt.legend(); plt.grid(True, linestyle="--", alpha=0.3); plt.tight_layout(); plt.show()
+
+    return dict(
+        theta_hat=theta_hat, result=result,
+        paths_opt=paths_opt, var_opt=var_opt, summary_opt=summary_opt,
+        fvar=fvar_opt[:n], idx=idx[:n], rv=rv[:n],
+        mu_d=mu_d, S0=S0
+    )
+
+
+# 7) EJECUCIÓN COMPLETA: BTC y ETH
+
+
+#  Simulación Heston estándar (benchmark) ---
+btc_heston = run_heston_symbol("BTC", "bitcoin.csv", seed=101)
+eth_heston = run_heston_symbol("ETH", "ethereum.csv", seed=202)
+
+# Análisis de volatilidad con parámetros estándar ---
+btc_vol_std = eval_heston_vol("BTC (std)", btc_heston)
+eth_vol_std = eval_heston_vol("ETH (std)", eth_heston)
+
+#  Calibración por DE + re-simulación y gráficos ---
+btc_fit = fit_heston_by_de_symbol("BTC", btc_heston['df'])
+eth_fit = fit_heston_by_de_symbol("ETH", eth_heston['df'])
+
+
